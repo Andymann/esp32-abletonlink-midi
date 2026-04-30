@@ -17,15 +17,16 @@
 #include <ableton/Link.hpp>
 #include "midi_parser.h"
 
-#define LED GPIO_NUM_4  // Ensure this is the correct pin for the R32 D1
 #define PRINT_LINK_STATE false
 
-#define USB_UART UART_NUM_0   // USB UART
-#define MIDI_UART UART_NUM_2  // Hardware MIDI UART
-#define USB_TX_PIN GPIO_NUM_1  // TXD0
-#define USB_RX_PIN GPIO_NUM_3  // RXD0
+#define USB_UART    UART_NUM_0  // USB UART
+#define MIDI_UART   UART_NUM_2  // Hardware MIDI UART on GPIO17/16
+#define MIDI2_UART  UART_NUM_1  // Second MIDI output on GPIO4
+#define USB_TX_PIN  GPIO_NUM_1  // TXD0
+#define USB_RX_PIN  GPIO_NUM_3  // RXD0
 #define MIDI_TX_PIN GPIO_NUM_17
 #define MIDI_RX_PIN GPIO_NUM_16
+#define MIDI2_TX_PIN GPIO_NUM_4
 #define USB_MIDI true
 #define LINK_TICK_PERIOD 100
 
@@ -139,13 +140,12 @@ static void initialize_wifi_ap(void) {
 }
 
 static void send_midi_message(const uint8_t *data, size_t length) {
-  // Send to hardware UART
-  uart_write_bytes(MIDI_UART, (const char *)data, length);
-  uart_wait_tx_done(MIDI_UART, 1);
-
-  // Send to USB UART
-  uart_write_bytes(USB_UART, (const char *)data, length);
-  uart_wait_tx_done(USB_UART, 1);
+  uart_write_bytes(MIDI_UART,  (const char *)data, length);
+  uart_wait_tx_done(MIDI_UART,  1);
+  uart_write_bytes(MIDI2_UART, (const char *)data, length);
+  uart_wait_tx_done(MIDI2_UART, 1);
+  uart_write_bytes(USB_UART,   (const char *)data, length);
+  uart_wait_tx_done(USB_UART,   1);
 }
 
 void IRAM_ATTR timer_isr(void *userParam) {
@@ -202,15 +202,14 @@ void tickTask(void *userParam) {
   link.enable(true);
   link.enableStartStopSync(true);
 
-  initUartPort(USB_UART, USB_TX_PIN, USB_RX_PIN);
-  initUartPort(MIDI_UART, MIDI_TX_PIN, MIDI_RX_PIN);
+  initUartPort(USB_UART,   USB_TX_PIN,   USB_RX_PIN);
+  initUartPort(MIDI_UART,  MIDI_TX_PIN,  MIDI_RX_PIN);
+  initUartPort(MIDI2_UART, MIDI2_TX_PIN, UART_PIN_NO_CHANGE);
 
   // Initialize MIDI parser for incoming clock/start/stop detection
   midi_parser_init();
 
   timerGroup0Init(LINK_TICK_PERIOD, xTaskGetCurrentTaskHandle());
-
-  gpio_set_direction(LED, GPIO_MODE_OUTPUT);
 
   bool was_connected = false;
   int64_t start_wait_time = esp_timer_get_time();
@@ -310,7 +309,6 @@ void tickTask(void *userParam) {
     static int length = LENGTH_NORMAL;
     static int lastBeat = -1;
     
-    // Use regular phase for LED timing
     const int currentBeat = static_cast<int>(std::floor(phase));
     const int beatInQuantum = currentBeat % static_cast<int>(quantum);
     const double beatFraction = phase - std::floor(phase);
@@ -344,7 +342,6 @@ void tickTask(void *userParam) {
         lastBeat = currentBeat;
       }
       
-      gpio_set_level(LED, shouldPlay);
       
       static bool was_playing = false;
       bool is_playing = state.isPlaying();
@@ -387,12 +384,12 @@ void tickTask(void *userParam) {
         }
       }
     } else {
-      gpio_set_level(LED, 0);
     }
 
     // WS2812 beat blink — only send when state changes to avoid blocking every tick
     static bool prev_led1 = false;
     static bool prev_led3 = false;
+    static bool prev_led3_playing = false;
 
     // LED[3]: phase restarts from 0 on each Link START
     static bool led3_was_playing = false;
@@ -413,11 +410,24 @@ void tickTask(void *userParam) {
 
     bool new_led1 = shouldPlay && midi_parser_is_clock_active();
     bool new_led3 = (led3_frac < 0.5) && is_connected;
-    if (new_led1 != prev_led1 || new_led3 != prev_led3) {
+
+    static int64_t last_pulse_us = 0;
+    const bool do_pulse = !led3_is_playing && is_connected &&
+                          (time.count() - last_pulse_us >= 20000);
+
+    if (new_led1 != prev_led1 || new_led3 != prev_led3 ||
+        led3_is_playing != prev_led3_playing || do_pulse) {
+      if (do_pulse) last_pulse_us = time.count();
       prev_led1 = new_led1;
       prev_led3 = new_led3;
+      prev_led3_playing = led3_is_playing;
       ws2812_set_led(1, 0, new_led1 ? 255 : 0, 0);
-      ws2812_set_led(3, 0, new_led3 ? 255 : 0, 0);
+      if (!led3_is_playing && is_connected) {
+        uint8_t red = (uint8_t)(sinf((float)M_PI * (float)led3_frac) * 255.0f);
+        ws2812_set_led(3, red, 0, 0);
+      } else {
+        ws2812_set_led(3, 0, new_led3 ? 255 : 0, 0);
+      }
       ws2812_show();
     }
 
