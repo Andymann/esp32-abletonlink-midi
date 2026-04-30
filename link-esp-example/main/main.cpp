@@ -3,6 +3,7 @@
 #include <cmath>
 #include <driver/gpio.h>
 #include <driver/timer.h>
+#include <driver/rmt.h>
 #include <driver/uart.h>
 #include <esp_event.h>
 #include <freertos/FreeRTOS.h>
@@ -34,12 +35,69 @@
 #define LENGTH_8BEAT           10    // Medium-long beep for half measure
 #define LENGTH_4BEAT           5    // Medium beep for quarter measure
 
+#define WS2812_PIN      GPIO_NUM_2
+#define WS2812_COUNT    5
+#define WS2812_RMT_CH   RMT_CHANNEL_0
+// 50ns/tick at 80MHz APB with divider 4
+#define WS2812_T0H  8
+#define WS2812_T0L  17
+#define WS2812_T1H  16
+#define WS2812_T1L  9
+
 #define MIDI_TIMING_CLOCK 0xF8
 #define MIDI_START 0xFA
 #define MIDI_STOP 0xFC
 #define MIDI_CONTINUE 0xFB
 
 static const char *TAG = "LINK_APP";
+
+static void ws2812_init(void) {
+  rmt_config_t cfg = RMT_DEFAULT_CONFIG_TX(WS2812_PIN, WS2812_RMT_CH);
+  cfg.clk_div = 4;
+  rmt_config(&cfg);
+  rmt_driver_install(WS2812_RMT_CH, 0, 0);
+}
+
+static uint8_t ws2812_buf[WS2812_COUNT][3];
+
+static void ws2812_show(void) {
+  rmt_item32_t items[WS2812_COUNT * 24];
+  for (int led = 0; led < WS2812_COUNT; led++) {
+    uint32_t grb = ((uint32_t)ws2812_buf[led][1] << 16) |
+                   ((uint32_t)ws2812_buf[led][0] << 8)  |
+                   ws2812_buf[led][2];
+    for (int bit = 23; bit >= 0; bit--) {
+      rmt_item32_t item;
+      item.level0 = 1;
+      item.level1 = 0;
+      if (grb & (1u << bit)) {
+        item.duration0 = WS2812_T1H;
+        item.duration1 = WS2812_T1L;
+      } else {
+        item.duration0 = WS2812_T0H;
+        item.duration1 = WS2812_T0L;
+      }
+      items[led * 24 + (23 - bit)] = item;
+    }
+  }
+  rmt_write_items(WS2812_RMT_CH, items, WS2812_COUNT * 24, true);
+  rmt_wait_tx_done(WS2812_RMT_CH, pdMS_TO_TICKS(10));
+}
+
+static void ws2812_set_led(int idx, uint8_t r, uint8_t g, uint8_t b) {
+  ws2812_buf[idx][0] = r;
+  ws2812_buf[idx][1] = g;
+  ws2812_buf[idx][2] = b;
+}
+
+static void ws2812_set_all(uint8_t r, uint8_t g, uint8_t b) {
+  for (int i = 0; i < WS2812_COUNT; i++) {
+    ws2812_buf[i][0] = r;
+    ws2812_buf[i][1] = g;
+    ws2812_buf[i][2] = b;
+  }
+  ws2812_show();
+}
 
 // WiFi AP configuration
 #define WIFI_SSID "Ableton-Link-ESP32"
@@ -259,7 +317,8 @@ void tickTask(void *userParam) {
     const int ticksInBeat = static_cast<int>(beatFraction * 150);
     
     bool crossedBeat = (currentBeat != lastBeat);
-    
+    bool shouldPlay = ticksInBeat < length;
+
     if (is_connected || force_start || midi_transport_running) {
       if (crossedBeat) {
         // Update beat characteristics based on position in quantum
@@ -284,9 +343,6 @@ void tickTask(void *userParam) {
         }
         lastBeat = currentBeat;
       }
-      
-      // Determine if we should be playing based on position within beat
-      bool shouldPlay = ticksInBeat < length;
       
       gpio_set_level(LED, shouldPlay);
       
@@ -333,6 +389,38 @@ void tickTask(void *userParam) {
     } else {
       gpio_set_level(LED, 0);
     }
+
+    // WS2812 beat blink — only send when state changes to avoid blocking every tick
+    static bool prev_led1 = false;
+    static bool prev_led3 = false;
+
+    // LED[3]: phase restarts from 0 on each Link START
+    static bool led3_was_playing = false;
+    static int64_t led3_beat_start_us = 0;
+    const bool led3_is_playing = state.isPlaying();
+    if (!led3_was_playing && led3_is_playing) {
+      led3_beat_start_us = time.count();
+    }
+    led3_was_playing = led3_is_playing;
+
+    double led3_frac = beatFraction;
+    if (led3_beat_start_us > 0) {
+      const double tempo = state.tempo();
+      const int64_t beat_us = (int64_t)(60.0e6 / tempo);
+      const int64_t elapsed = time.count() - led3_beat_start_us;
+      led3_frac = (double)(elapsed % beat_us) / (double)beat_us;
+    }
+
+    bool new_led1 = shouldPlay && midi_parser_is_clock_active();
+    bool new_led3 = (led3_frac < 0.5) && is_connected;
+    if (new_led1 != prev_led1 || new_led3 != prev_led3) {
+      prev_led1 = new_led1;
+      prev_led3 = new_led3;
+      ws2812_set_led(1, 0, new_led1 ? 255 : 0, 0);
+      ws2812_set_led(3, 0, new_led3 ? 255 : 0, 0);
+      ws2812_show();
+    }
+
     lastTicks = ticks;
   }
 }
@@ -351,6 +439,11 @@ extern "C" void app_main() {
 
   // Setup WiFi as Access Point
   initialize_wifi_ap();
+
+  ws2812_init();
+  ws2812_set_all(0, 255, 0);
+  vTaskDelay(pdMS_TO_TICKS(2000));
+  ws2812_set_all(0, 0, 0);
 
   xTaskCreate(tickTask, "ticks", 16384, nullptr, 10, nullptr);
 }
