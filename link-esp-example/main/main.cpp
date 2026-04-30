@@ -4,7 +4,6 @@
 #include <driver/gpio.h>
 #include <driver/timer.h>
 #include <driver/uart.h>
-#include <driver/ledc.h>
 #include <esp_event.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
@@ -18,7 +17,6 @@
 #include "midi_parser.h"
 
 #define LED GPIO_NUM_4  // Ensure this is the correct pin for the R32 D1
-#define BUZZER GPIO_NUM_2 // Define the pin for the buzzer
 #define PRINT_LINK_STATE false
 
 #define USB_UART UART_NUM_0   // USB UART
@@ -29,20 +27,6 @@
 #define MIDI_RX_PIN GPIO_NUM_16
 #define USB_MIDI true
 #define LINK_TICK_PERIOD 100
-
-// PWM configuration for passive buzzer
-#define LEDC_MODE              LEDC_HIGH_SPEED_MODE  // Use high speed mode for better frequency accuracy
-#define LEDC_DUTY_RES         LEDC_TIMER_10_BIT  // Set duty resolution to 10 bits
-#define LEDC_DUTY             (512)              // 50% duty cycle (512 out of 1024)
-#define LEDC_TIMER            LEDC_TIMER_0
-#define LEDC_CHANNEL          LEDC_CHANNEL_0
-#define LEDC_OUTPUT_IO        BUZZER             // Define buzzer GPIO
-
-// Different frequencies for different beat positions (in Hz)
-#define FREQ_16BEAT            2093u  // C7 note
-#define FREQ_8BEAT             1568u  // G6 note
-#define FREQ_4BEAT             1319u  // E6 note
-#define FREQ_NORMAL            1047u  // C6 note
 
 // Different lengths for different beat positions (in ticks)
 #define LENGTH_NORMAL          1    // Short beep for regular beats
@@ -155,59 +139,6 @@ void initUartPort(uart_port_t port, int txPin, int rxPin) {
   uart_driver_install(port, 512, 0, 0, NULL, 0);
 }
 
-void setupBuzzer() {
-    // Configure LEDC timer for buzzer PWM
-    ledc_timer_config_t ledc_timer = {
-        .speed_mode = LEDC_MODE,
-        .duty_resolution = LEDC_DUTY_RES,
-        .timer_num = LEDC_TIMER,
-        .freq_hz = FREQ_NORMAL,  // Start with normal frequency
-        .clk_cfg = LEDC_AUTO_CLK
-    };
-    ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer));
-
-    // Configure LEDC channel
-    ledc_channel_config_t ledc_channel = {
-        .gpio_num = LEDC_OUTPUT_IO,
-        .speed_mode = LEDC_MODE,
-        .channel = LEDC_CHANNEL,
-        .intr_type = LEDC_INTR_DISABLE,
-        .timer_sel = LEDC_TIMER,
-        .duty = 0,
-        .hpoint = 0,
-        .flags = {0}  // Initialize flags to 0
-    };
-    ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
-}
-
-void setBuzzerState(bool on, uint32_t frequency = FREQ_NORMAL) {
-    static uint32_t lastFreq = FREQ_NORMAL;
-    
-    if (on) {
-        // Only update frequency if it changed
-        if (frequency != lastFreq) {
-            // Configure timer for passive buzzer
-            ledc_timer_config_t ledc_timer = {
-                .speed_mode = LEDC_MODE,
-                .duty_resolution = LEDC_DUTY_RES,
-                .timer_num = LEDC_TIMER,
-                .freq_hz = frequency,
-                .clk_cfg = LEDC_AUTO_CLK
-            };
-            ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer));
-            lastFreq = frequency;
-        }
-        
-        // Set 50% duty cycle for passive buzzer to produce sound
-        ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, LEDC_DUTY);
-        ledc_update_duty(LEDC_MODE, LEDC_CHANNEL);
-    } else {
-        // Turn off by setting duty to 0
-        ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, 0);
-        ledc_update_duty(LEDC_MODE, LEDC_CHANNEL);
-    }
-}
-
 void tickTask(void *userParam) {
   ableton::Link link(117.0f);
   link.enable(true);
@@ -222,10 +153,6 @@ void tickTask(void *userParam) {
   timerGroup0Init(LINK_TICK_PERIOD, xTaskGetCurrentTaskHandle());
 
   gpio_set_direction(LED, GPIO_MODE_OUTPUT);
-  gpio_set_direction(BUZZER, GPIO_MODE_OUTPUT);
-  
-  // Setup buzzer PWM
-  setupBuzzer();
 
   bool was_connected = false;
   int64_t start_wait_time = esp_timer_get_time();
@@ -324,9 +251,8 @@ void tickTask(void *userParam) {
 
     static int length = LENGTH_NORMAL;
     static int lastBeat = -1;
-    static int currentFreq = FREQ_NORMAL;
     
-    // Use regular phase for LED and buzzer timing
+    // Use regular phase for LED timing
     const int currentBeat = static_cast<int>(std::floor(phase));
     const int beatInQuantum = currentBeat % static_cast<int>(quantum);
     const double beatFraction = phase - std::floor(phase);
@@ -339,7 +265,6 @@ void tickTask(void *userParam) {
         // Update beat characteristics based on position in quantum
         if (beatInQuantum == 0) {  // First beat of quantum (measure start)
           length = LENGTH_16BEAT;
-          currentFreq = FREQ_16BEAT;
           // Re-sync USB UART slave at every quantum boundary
           const uint8_t usb_stop = MIDI_STOP;
           uart_write_bytes(USB_UART, (const char *)&usb_stop, 1);
@@ -352,13 +277,10 @@ void tickTask(void *userParam) {
           uart_wait_tx_done(USB_UART, 1);
         } else if (beatInQuantum == 8) {  // Middle of measure (8th beat)
           length = LENGTH_8BEAT;
-          currentFreq = FREQ_8BEAT;
         } else if (beatInQuantum == 4 || beatInQuantum == 12) {  // Quarter points
           length = LENGTH_4BEAT;
-          currentFreq = FREQ_4BEAT;
         } else {  // Regular beats
           length = LENGTH_NORMAL;
-          currentFreq = FREQ_NORMAL;
         }
         lastBeat = currentBeat;
       }
@@ -366,9 +288,7 @@ void tickTask(void *userParam) {
       // Determine if we should be playing based on position within beat
       bool shouldPlay = ticksInBeat < length;
       
-      // Set LED and buzzer states
       gpio_set_level(LED, shouldPlay);
-      setBuzzerState(shouldPlay, currentFreq);
       
       static bool was_playing = false;
       bool is_playing = state.isPlaying();
@@ -412,7 +332,6 @@ void tickTask(void *userParam) {
       }
     } else {
       gpio_set_level(LED, 0);
-      setBuzzerState(false);
     }
     lastTicks = ticks;
   }
