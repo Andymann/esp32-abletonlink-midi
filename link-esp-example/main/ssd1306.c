@@ -10,8 +10,6 @@
 #define I2C_FREQ_HZ  400000
 #define OLED_ADDR    0x3C
 
-// 4 text rows distributed across 8 pages (rows 0-3 → pages 0,2,4,6)
-static const uint8_t row_page[4] = { 0, 2, 4, 6 };
 
 // 5x8 ASCII font, chars 0x20–0x7E, column-major, bit0 = top pixel
 static const uint8_t font[][5] = {
@@ -181,61 +179,61 @@ void ssd1306_clear(void)
     }
 }
 
-// Expands 4 bits → 8 bits, doubling each bit (for 2x vertical scaling)
-static uint8_t expand_bits(uint8_t nibble)
+void ssd1306_write_string(uint8_t row, const char *str, bool center, uint8_t scale_x, uint8_t scale_y)
 {
-    uint8_t out = 0;
-    if (nibble & 0x01) out |= 0x03;
-    if (nibble & 0x02) out |= 0x0C;
-    if (nibble & 0x04) out |= 0x30;
-    if (nibble & 0x08) out |= 0xC0;
-    return out;
-}
+    if (scale_x < 1) scale_x = 1;
+    if (scale_x > 8) scale_x = 8;
+    if (scale_y < 1) scale_y = 1;
+    if (scale_y > 8) scale_y = 8;
 
-// 2x scale: each char is 12px wide (5*2 + 2 space), 16px tall (2 pages)
-#define CHAR_W 12
+    uint8_t max_rows = 8 / scale_y;
+    if (row >= max_rows) return;
 
-void ssd1306_write_string(uint8_t row, const char *str, bool center)
-{
-    if (row > 3) return;
-    uint8_t page = row_page[row]; // uses pages page and page+1
+    uint8_t start_page = row * scale_y;
+    uint8_t char_w = (uint8_t)(6 * scale_x); // 5 cols × scale_x + scale_x spacing
 
     int len = (int)strlen(str);
-    int col = center ? (128 - len * CHAR_W) / 2 : 0;
+    int col = center ? (128 - len * char_w) / 2 : 0;
     if (col < 0) col = 0;
 
-    int draw_w = len * CHAR_W;
+    int draw_w = len * char_w;
     if (col + draw_w > 128) draw_w = 128 - col;
     if (draw_w <= 0) return;
 
-    // Render both pages into buffers (top and bottom half of 16px character)
-    uint8_t buf0[128] = {0};
-    uint8_t buf1[128] = {0};
-
-    int x = 0;
-    for (int i = 0; i < len; i++) {
-        char c = str[i];
-        if (c < 0x20 || c > 0x7E) c = ' ';
-        const uint8_t *glyph = font[(uint8_t)(c - 0x20)];
-        for (int j = 0; j < 5; j++) {
-            uint8_t b = glyph[j];
-            uint8_t p0 = expand_bits(b & 0x0F);        // top 8px from low nibble
-            uint8_t p1 = expand_bits((b >> 4) & 0x0F); // bottom 8px from high nibble
-            // 2x horizontal: write each column twice
-            if (x     < draw_w) { buf0[x]   = p0; buf1[x]   = p1; }
-            if (x + 1 < draw_w) { buf0[x+1] = p0; buf1[x+1] = p1; }
-            x += 2;
-        }
-        x += 2; // 2px spacing
-    }
-
     uint8_t end_col = (uint8_t)(col + draw_w - 1);
 
-    uint8_t pos0[] = { 0x21, (uint8_t)col, end_col, 0x22, page,           page           };
-    oled_cmd(pos0, sizeof(pos0));
-    oled_data(buf0, draw_w);
+    for (int pg = 0; pg < scale_y; pg++) {
+        uint8_t buf[128] = {0};
+        int x = 0;
 
-    uint8_t pos1[] = { 0x21, (uint8_t)col, end_col, 0x22, (uint8_t)(page+1), (uint8_t)(page+1) };
-    oled_cmd(pos1, sizeof(pos1));
-    oled_data(buf1, draw_w);
+        for (int i = 0; i < len; i++) {
+            char c = str[i];
+            if (c < 0x20 || c > 0x7E) c = ' ';
+            const uint8_t *glyph = font[(uint8_t)(c - 0x20)];
+
+            for (int j = 0; j < 5; j++) {
+                uint8_t b = glyph[j];
+
+                uint8_t page_byte = 0;
+                for (int bp = 0; bp < 8; bp++) {
+                    int src_bit = (pg * 8 + bp) / scale_y;
+                    if (src_bit < 8 && (b & (1u << src_bit))) {
+                        page_byte |= (1u << bp);
+                    }
+                }
+
+                for (int sx = 0; sx < scale_x; sx++) {
+                    int px = x + sx;
+                    if (px < draw_w) buf[px] = page_byte;
+                }
+                x += scale_x;
+            }
+            x += scale_x; // inter-character spacing
+        }
+
+        uint8_t page = start_page + (uint8_t)pg;
+        uint8_t pos[] = { 0x21, (uint8_t)col, end_col, 0x22, page, page };
+        oled_cmd(pos, sizeof(pos));
+        oled_data(buf, draw_w);
+    }
 }

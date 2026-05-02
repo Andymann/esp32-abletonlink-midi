@@ -222,6 +222,7 @@ void tickTask(void *userParam) {
     uint8_t midi_byte;
     int bytes_read = uart_read_bytes(MIDI_UART, &midi_byte, 1, 0);
     while (bytes_read > 0) {
+      send_midi_message(&midi_byte, 1);
       midi_message_type_t msg = midi_parser_process_byte(midi_byte);
 
       switch (msg) {
@@ -356,11 +357,11 @@ void tickTask(void *userParam) {
         lastTicks = ticks - 1;
       }
 
-      // Send exactly one 0xF8 timing clock per 24ppqn tick transition
-      if (ticks > lastTicks) {
+      // Send exactly one 0xF8 timing clock per 24ppqn tick transition.
+      // Suppressed when MIDI clock is incoming — that clock is mirrored directly.
+      if (ticks > lastTicks && !midi_parser_is_clock_active()) {
         const uint8_t timing_msg = MIDI_TIMING_CLOCK;
         send_midi_message(&timing_msg, 1);
-
       }
     } else {
     }
@@ -431,14 +432,16 @@ extern "C" void app_main() {
 
   ssd1306_init();
   ssd1306_clear();
-  ssd1306_write_string(0, "uku!", true);
-  vTaskDelay(pdMS_TO_TICKS(3000));
-  ssd1306_clear();
+  ssd1306_write_string(0, "Ableton Link", true, 1, 2);
+  ssd1306_write_string(2, "Midi Clock Bridge", true, 1, 1);
+  //ssd1306_write_string(3, " ", true, 1, 1);
+  ssd1306_write_string(3, "Firmware v0.5", true, 2, 2);
 
   ws2812_init();
   ws2812_set_all(0, 255, 0);
-  vTaskDelay(pdMS_TO_TICKS(2000));
+  vTaskDelay(pdMS_TO_TICKS(4000));
   ws2812_set_all(0, 0, 0);
+  ssd1306_clear();
 
   xTaskCreate(tickTask, "ticks", 16384, nullptr, 10, nullptr);
 }

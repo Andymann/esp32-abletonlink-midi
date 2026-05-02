@@ -12,8 +12,10 @@ extern "C" {
 void ssd1306_init(void);
 void ssd1306_clear(void);
 
-// row: 0-3  |  center: true = centre-align, false = left-align
-void ssd1306_write_string(uint8_t row, const char *str, bool center);
+// row: 0..(8/scale_y - 1)  |  center: true = centre-align, false = left-align
+// scale_x: horizontal pixel repeat (1 = 5px wide, 2 = 10px, …)
+// scale_y: vertical pixel repeat  (1 = 8px tall, 2 = 16px, …)
+void ssd1306_write_string(uint8_t row, const char *str, bool center, uint8_t scale_x, uint8_t scale_y);
 
 #ifdef __cplusplus
 }
