@@ -279,6 +279,7 @@ void tickTask(void *userParam) {
     
     if (is_connected != was_connected) {
       if (is_connected) {
+      /*
         // Send MIDI reset sequence when connection is established
         const uint8_t stop_msg[] = {MIDI_STOP};
         send_midi_message(stop_msg, 1);
@@ -286,6 +287,7 @@ void tickTask(void *userParam) {
 
         const uint8_t start_msg[] = {MIDI_START};
         send_midi_message(start_msg, 1);
+      */
       }
       was_connected = is_connected;
     }
