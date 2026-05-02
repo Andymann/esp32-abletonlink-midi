@@ -3,8 +3,8 @@
 #include <cmath>
 #include <driver/gpio.h>
 #include <driver/timer.h>
+#include <driver/rmt.h>
 #include <driver/uart.h>
-#include <driver/ledc.h>
 #include <esp_event.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
@@ -16,33 +16,20 @@
 
 #include <ableton/Link.hpp>
 #include "midi_parser.h"
+#include "ssd1306.h"
 
-#define LED GPIO_NUM_4  // Ensure this is the correct pin for the R32 D1
-#define BUZZER GPIO_NUM_2 // Define the pin for the buzzer
 #define PRINT_LINK_STATE false
 
-#define USB_UART UART_NUM_0   // USB UART
-#define MIDI_UART UART_NUM_2  // Hardware MIDI UART
-#define USB_TX_PIN GPIO_NUM_1  // TXD0
-#define USB_RX_PIN GPIO_NUM_3  // RXD0
+#define USB_UART    UART_NUM_0  // USB UART
+#define MIDI_UART   UART_NUM_2  // Hardware MIDI UART on GPIO17/16
+#define MIDI2_UART  UART_NUM_1  // Second MIDI output on GPIO4
+#define USB_TX_PIN  GPIO_NUM_1  // TXD0
+#define USB_RX_PIN  GPIO_NUM_3  // RXD0
 #define MIDI_TX_PIN GPIO_NUM_17
 #define MIDI_RX_PIN GPIO_NUM_16
+#define MIDI2_TX_PIN GPIO_NUM_4
 #define USB_MIDI true
 #define LINK_TICK_PERIOD 100
-
-// PWM configuration for passive buzzer
-#define LEDC_MODE              LEDC_HIGH_SPEED_MODE  // Use high speed mode for better frequency accuracy
-#define LEDC_DUTY_RES         LEDC_TIMER_10_BIT  // Set duty resolution to 10 bits
-#define LEDC_DUTY             (512)              // 50% duty cycle (512 out of 1024)
-#define LEDC_TIMER            LEDC_TIMER_0
-#define LEDC_CHANNEL          LEDC_CHANNEL_0
-#define LEDC_OUTPUT_IO        BUZZER             // Define buzzer GPIO
-
-// Different frequencies for different beat positions (in Hz)
-#define FREQ_16BEAT            2093u  // C7 note
-#define FREQ_8BEAT             1568u  // G6 note
-#define FREQ_4BEAT             1319u  // E6 note
-#define FREQ_NORMAL            1047u  // C6 note
 
 // Different lengths for different beat positions (in ticks)
 #define LENGTH_NORMAL          1    // Short beep for regular beats
@@ -50,12 +37,69 @@
 #define LENGTH_8BEAT           10    // Medium-long beep for half measure
 #define LENGTH_4BEAT           5    // Medium beep for quarter measure
 
+#define WS2812_PIN      GPIO_NUM_2
+#define WS2812_COUNT    5
+#define WS2812_RMT_CH   RMT_CHANNEL_0
+// 50ns/tick at 80MHz APB with divider 4
+#define WS2812_T0H  8
+#define WS2812_T0L  17
+#define WS2812_T1H  16
+#define WS2812_T1L  9
+
 #define MIDI_TIMING_CLOCK 0xF8
 #define MIDI_START 0xFA
 #define MIDI_STOP 0xFC
 #define MIDI_CONTINUE 0xFB
 
 static const char *TAG = "LINK_APP";
+
+static void ws2812_init(void) {
+  rmt_config_t cfg = RMT_DEFAULT_CONFIG_TX(WS2812_PIN, WS2812_RMT_CH);
+  cfg.clk_div = 4;
+  rmt_config(&cfg);
+  rmt_driver_install(WS2812_RMT_CH, 0, 0);
+}
+
+static uint8_t ws2812_buf[WS2812_COUNT][3];
+
+static void ws2812_show(void) {
+  rmt_item32_t items[WS2812_COUNT * 24];
+  for (int led = 0; led < WS2812_COUNT; led++) {
+    uint32_t grb = ((uint32_t)ws2812_buf[led][1] << 16) |
+                   ((uint32_t)ws2812_buf[led][0] << 8)  |
+                   ws2812_buf[led][2];
+    for (int bit = 23; bit >= 0; bit--) {
+      rmt_item32_t item;
+      item.level0 = 1;
+      item.level1 = 0;
+      if (grb & (1u << bit)) {
+        item.duration0 = WS2812_T1H;
+        item.duration1 = WS2812_T1L;
+      } else {
+        item.duration0 = WS2812_T0H;
+        item.duration1 = WS2812_T0L;
+      }
+      items[led * 24 + (23 - bit)] = item;
+    }
+  }
+  rmt_write_items(WS2812_RMT_CH, items, WS2812_COUNT * 24, true);
+  rmt_wait_tx_done(WS2812_RMT_CH, pdMS_TO_TICKS(10));
+}
+
+static void ws2812_set_led(int idx, uint8_t r, uint8_t g, uint8_t b) {
+  ws2812_buf[idx][0] = r;
+  ws2812_buf[idx][1] = g;
+  ws2812_buf[idx][2] = b;
+}
+
+static void ws2812_set_all(uint8_t r, uint8_t g, uint8_t b) {
+  for (int i = 0; i < WS2812_COUNT; i++) {
+    ws2812_buf[i][0] = r;
+    ws2812_buf[i][1] = g;
+    ws2812_buf[i][2] = b;
+  }
+  ws2812_show();
+}
 
 // WiFi AP configuration
 #define WIFI_SSID "Ableton-Link-ESP32"
@@ -97,13 +141,12 @@ static void initialize_wifi_ap(void) {
 }
 
 static void send_midi_message(const uint8_t *data, size_t length) {
-  // Send to hardware UART
-  uart_write_bytes(MIDI_UART, (const char *)data, length);
-  uart_wait_tx_done(MIDI_UART, 1);
-
-  // Send to USB UART
-  uart_write_bytes(USB_UART, (const char *)data, length);
-  uart_wait_tx_done(USB_UART, 1);
+  uart_write_bytes(MIDI_UART,  (const char *)data, length);
+  uart_wait_tx_done(MIDI_UART,  1);
+  uart_write_bytes(MIDI2_UART, (const char *)data, length);
+  uart_wait_tx_done(MIDI2_UART, 1);
+  uart_write_bytes(USB_UART,   (const char *)data, length);
+  uart_wait_tx_done(USB_UART,   1);
 }
 
 void IRAM_ATTR timer_isr(void *userParam) {
@@ -155,77 +198,19 @@ void initUartPort(uart_port_t port, int txPin, int rxPin) {
   uart_driver_install(port, 512, 0, 0, NULL, 0);
 }
 
-void setupBuzzer() {
-    // Configure LEDC timer for buzzer PWM
-    ledc_timer_config_t ledc_timer = {
-        .speed_mode = LEDC_MODE,
-        .duty_resolution = LEDC_DUTY_RES,
-        .timer_num = LEDC_TIMER,
-        .freq_hz = FREQ_NORMAL,  // Start with normal frequency
-        .clk_cfg = LEDC_AUTO_CLK
-    };
-    ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer));
-
-    // Configure LEDC channel
-    ledc_channel_config_t ledc_channel = {
-        .gpio_num = LEDC_OUTPUT_IO,
-        .speed_mode = LEDC_MODE,
-        .channel = LEDC_CHANNEL,
-        .intr_type = LEDC_INTR_DISABLE,
-        .timer_sel = LEDC_TIMER,
-        .duty = 0,
-        .hpoint = 0,
-        .flags = {0}  // Initialize flags to 0
-    };
-    ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
-}
-
-void setBuzzerState(bool on, uint32_t frequency = FREQ_NORMAL) {
-    static uint32_t lastFreq = FREQ_NORMAL;
-    
-    if (on) {
-        // Only update frequency if it changed
-        if (frequency != lastFreq) {
-            // Configure timer for passive buzzer
-            ledc_timer_config_t ledc_timer = {
-                .speed_mode = LEDC_MODE,
-                .duty_resolution = LEDC_DUTY_RES,
-                .timer_num = LEDC_TIMER,
-                .freq_hz = frequency,
-                .clk_cfg = LEDC_AUTO_CLK
-            };
-            ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer));
-            lastFreq = frequency;
-        }
-        
-        // Set 50% duty cycle for passive buzzer to produce sound
-        ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, LEDC_DUTY);
-        ledc_update_duty(LEDC_MODE, LEDC_CHANNEL);
-    } else {
-        // Turn off by setting duty to 0
-        ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, 0);
-        ledc_update_duty(LEDC_MODE, LEDC_CHANNEL);
-    }
-}
-
 void tickTask(void *userParam) {
   ableton::Link link(117.0f);
   link.enable(true);
   link.enableStartStopSync(true);
 
-  initUartPort(USB_UART, USB_TX_PIN, USB_RX_PIN);
-  initUartPort(MIDI_UART, MIDI_TX_PIN, MIDI_RX_PIN);
+  initUartPort(USB_UART,   USB_TX_PIN,   USB_RX_PIN);
+  initUartPort(MIDI_UART,  MIDI_TX_PIN,  MIDI_RX_PIN);
+  initUartPort(MIDI2_UART, MIDI2_TX_PIN, UART_PIN_NO_CHANGE);
 
   // Initialize MIDI parser for incoming clock/start/stop detection
   midi_parser_init();
 
   timerGroup0Init(LINK_TICK_PERIOD, xTaskGetCurrentTaskHandle());
-
-  gpio_set_direction(LED, GPIO_MODE_OUTPUT);
-  gpio_set_direction(BUZZER, GPIO_MODE_OUTPUT);
-  
-  // Setup buzzer PWM
-  setupBuzzer();
 
   bool was_connected = false;
   int64_t start_wait_time = esp_timer_get_time();
@@ -324,22 +309,20 @@ void tickTask(void *userParam) {
 
     static int length = LENGTH_NORMAL;
     static int lastBeat = -1;
-    static int currentFreq = FREQ_NORMAL;
     
-    // Use regular phase for LED and buzzer timing
     const int currentBeat = static_cast<int>(std::floor(phase));
     const int beatInQuantum = currentBeat % static_cast<int>(quantum);
     const double beatFraction = phase - std::floor(phase);
     const int ticksInBeat = static_cast<int>(beatFraction * 150);
     
     bool crossedBeat = (currentBeat != lastBeat);
-    
+    bool shouldPlay = ticksInBeat < length;
+
     if (is_connected || force_start || midi_transport_running) {
       if (crossedBeat) {
         // Update beat characteristics based on position in quantum
         if (beatInQuantum == 0) {  // First beat of quantum (measure start)
           length = LENGTH_16BEAT;
-          currentFreq = FREQ_16BEAT;
           // Re-sync USB UART slave at every quantum boundary
           const uint8_t usb_stop = MIDI_STOP;
           uart_write_bytes(USB_UART, (const char *)&usb_stop, 1);
@@ -352,23 +335,14 @@ void tickTask(void *userParam) {
           uart_wait_tx_done(USB_UART, 1);
         } else if (beatInQuantum == 8) {  // Middle of measure (8th beat)
           length = LENGTH_8BEAT;
-          currentFreq = FREQ_8BEAT;
         } else if (beatInQuantum == 4 || beatInQuantum == 12) {  // Quarter points
           length = LENGTH_4BEAT;
-          currentFreq = FREQ_4BEAT;
         } else {  // Regular beats
           length = LENGTH_NORMAL;
-          currentFreq = FREQ_NORMAL;
         }
         lastBeat = currentBeat;
       }
       
-      // Determine if we should be playing based on position within beat
-      bool shouldPlay = ticksInBeat < length;
-      
-      // Set LED and buzzer states
-      gpio_set_level(LED, shouldPlay);
-      setBuzzerState(shouldPlay, currentFreq);
       
       static bool was_playing = false;
       bool is_playing = state.isPlaying();
@@ -411,9 +385,53 @@ void tickTask(void *userParam) {
         }
       }
     } else {
-      gpio_set_level(LED, 0);
-      setBuzzerState(false);
     }
+
+    // WS2812 beat blink — only send when state changes to avoid blocking every tick
+    static bool prev_led1 = false;
+    static bool prev_led3 = false;
+    static bool prev_led3_playing = false;
+
+    // LED[3]: phase restarts from 0 on each Link START
+    static bool led3_was_playing = false;
+    static int64_t led3_beat_start_us = 0;
+    const bool led3_is_playing = state.isPlaying();
+    if (!led3_was_playing && led3_is_playing) {
+      led3_beat_start_us = time.count();
+    }
+    led3_was_playing = led3_is_playing;
+
+    double led3_frac = beatFraction;
+    if (led3_beat_start_us > 0) {
+      const double tempo = state.tempo();
+      const int64_t beat_us = (int64_t)(60.0e6 / tempo);
+      const int64_t elapsed = time.count() - led3_beat_start_us;
+      led3_frac = (double)(elapsed % beat_us) / (double)beat_us;
+    }
+
+    bool new_led1 = shouldPlay && midi_parser_is_clock_active();
+    bool new_led3 = (led3_frac < 0.5) && is_connected;
+
+    static int64_t last_pulse_us = 0;
+    const bool do_pulse = !led3_is_playing && is_connected &&
+                          (time.count() - last_pulse_us >= 20000);
+
+    if (new_led1 != prev_led1 || new_led3 != prev_led3 ||
+        led3_is_playing != prev_led3_playing || do_pulse) {
+      if (do_pulse) last_pulse_us = time.count();
+      prev_led1 = new_led1;
+      prev_led3 = new_led3;
+      prev_led3_playing = led3_is_playing;
+      ws2812_set_led(1, 0, new_led1 ? 255 : 0, 0);
+      if (!led3_is_playing && is_connected) {
+        uint8_t red = (uint8_t)(sinf((float)M_PI * (float)led3_frac) * 255.0f);
+        ws2812_set_led(3, red, 0, 0);
+      } else {
+        ws2812_set_led(3, 0, new_led3 ? 255 : 0, 0);
+      }
+      ws2812_show();
+    }
+
     lastTicks = ticks;
   }
 }
@@ -432,6 +450,17 @@ extern "C" void app_main() {
 
   // Setup WiFi as Access Point
   initialize_wifi_ap();
+
+  ssd1306_init();
+  ssd1306_clear();
+  ssd1306_write_string(0, "uku!", true);
+  vTaskDelay(pdMS_TO_TICKS(3000));
+  ssd1306_clear();
+
+  ws2812_init();
+  ws2812_set_all(0, 255, 0);
+  vTaskDelay(pdMS_TO_TICKS(2000));
+  ws2812_set_all(0, 0, 0);
 
   xTaskCreate(tickTask, "ticks", 16384, nullptr, 10, nullptr);
 }
