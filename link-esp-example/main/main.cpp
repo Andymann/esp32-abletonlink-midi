@@ -20,15 +20,11 @@
 
 #define PRINT_LINK_STATE false
 
-#define USB_UART    UART_NUM_0  // USB UART
 #define MIDI_UART   UART_NUM_2  // Hardware MIDI UART on GPIO17/16
 #define MIDI2_UART  UART_NUM_1  // Second MIDI output on GPIO4
-#define USB_TX_PIN  GPIO_NUM_1  // TXD0
-#define USB_RX_PIN  GPIO_NUM_3  // RXD0
 #define MIDI_TX_PIN GPIO_NUM_17
 #define MIDI_RX_PIN GPIO_NUM_16
 #define MIDI2_TX_PIN GPIO_NUM_4
-#define USB_MIDI true
 #define LINK_TICK_PERIOD 100
 
 // Different lengths for different beat positions (in ticks)
@@ -145,8 +141,6 @@ static void send_midi_message(const uint8_t *data, size_t length) {
   uart_wait_tx_done(MIDI_UART,  1);
   uart_write_bytes(MIDI2_UART, (const char *)data, length);
   uart_wait_tx_done(MIDI2_UART, 1);
-  uart_write_bytes(USB_UART,   (const char *)data, length);
-  uart_wait_tx_done(USB_UART,   1);
 }
 
 void IRAM_ATTR timer_isr(void *userParam) {
@@ -203,7 +197,6 @@ void tickTask(void *userParam) {
   link.enable(true);
   link.enableStartStopSync(true);
 
-  initUartPort(USB_UART,   USB_TX_PIN,   USB_RX_PIN);
   initUartPort(MIDI_UART,  MIDI_TX_PIN,  MIDI_RX_PIN);
   initUartPort(MIDI2_UART, MIDI2_TX_PIN, UART_PIN_NO_CHANGE);
 
@@ -323,16 +316,6 @@ void tickTask(void *userParam) {
         // Update beat characteristics based on position in quantum
         if (beatInQuantum == 0) {  // First beat of quantum (measure start)
           length = LENGTH_16BEAT;
-          // Re-sync USB UART slave at every quantum boundary
-          const uint8_t usb_stop = MIDI_STOP;
-          uart_write_bytes(USB_UART, (const char *)&usb_stop, 1);
-          uart_wait_tx_done(USB_UART, 1);
-          const uint8_t spp_zero[] = {0xF2, 0x00, 0x00};
-          uart_write_bytes(USB_UART, (const char *)spp_zero, sizeof(spp_zero));
-          uart_wait_tx_done(USB_UART, 1);
-          const uint8_t usb_start = MIDI_START;
-          uart_write_bytes(USB_UART, (const char *)&usb_start, 1);
-          uart_wait_tx_done(USB_UART, 1);
         } else if (beatInQuantum == 8) {  // Middle of measure (8th beat)
           length = LENGTH_8BEAT;
         } else if (beatInQuantum == 4 || beatInQuantum == 12) {  // Quarter points
@@ -376,13 +359,6 @@ void tickTask(void *userParam) {
         const uint8_t timing_msg = MIDI_TIMING_CLOCK;
         send_midi_message(&timing_msg, 1);
 
-        // Send SPP to USB UART every 16th note (6 MIDI clocks per 16th note at 24ppqn)
-        if (ticks % 6 == 0) {
-          uint16_t spp_pos = (uint16_t)((ticks / 6) % 32768);
-          uint8_t spp_msg[] = {0xF2, (uint8_t)(spp_pos & 0x7F), (uint8_t)((spp_pos >> 7) & 0x7F)};
-          uart_write_bytes(USB_UART, (const char *)spp_msg, sizeof(spp_msg));
-          uart_wait_tx_done(USB_UART, 1);
-        }
       }
     } else {
     }
