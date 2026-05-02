@@ -16,6 +16,7 @@
 
 #include <ableton/Link.hpp>
 #include "midi_parser.h"
+#include "ssd1306.h"
 
 #define PRINT_LINK_STATE false
 
@@ -449,6 +450,12 @@ extern "C" void app_main() {
 
   // Setup WiFi as Access Point
   initialize_wifi_ap();
+
+  ssd1306_init();
+  ssd1306_clear();
+  ssd1306_write_string(0, "uku!", true);
+  vTaskDelay(pdMS_TO_TICKS(3000));
+  ssd1306_clear();
 
   ws2812_init();
   ws2812_set_all(0, 255, 0);
