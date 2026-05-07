@@ -3,6 +3,9 @@
 #include <driver/i2c.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <esp_log.h>
+
+static const char *OTAG = "SSD1306";
 
 #define I2C_PORT     I2C_NUM_0
 #define SDA_PIN      21
@@ -118,7 +121,8 @@ static void oled_cmd(const uint8_t *buf, size_t n)
     i2c_master_write_byte(h, 0x00, true); // Co=0, D/C=0: command stream
     i2c_master_write(h, (uint8_t *)buf, n, true);
     i2c_master_stop(h);
-    i2c_master_cmd_begin(I2C_PORT, h, pdMS_TO_TICKS(100));
+    esp_err_t ret = i2c_master_cmd_begin(I2C_PORT, h, pdMS_TO_TICKS(100));
+    if (ret != ESP_OK) ESP_LOGE(OTAG, "cmd I2C error: %s", esp_err_to_name(ret));
     i2c_cmd_link_delete(h);
 }
 
@@ -130,7 +134,8 @@ static void oled_data(const uint8_t *buf, size_t n)
     i2c_master_write_byte(h, 0x40, true); // Co=0, D/C=1: data stream
     i2c_master_write(h, (uint8_t *)buf, n, true);
     i2c_master_stop(h);
-    i2c_master_cmd_begin(I2C_PORT, h, pdMS_TO_TICKS(100));
+    esp_err_t ret = i2c_master_cmd_begin(I2C_PORT, h, pdMS_TO_TICKS(100));
+    if (ret != ESP_OK) ESP_LOGE(OTAG, "data I2C error: %s", esp_err_to_name(ret));
     i2c_cmd_link_delete(h);
 }
 
@@ -167,6 +172,7 @@ void ssd1306_init(void)
         0xAF,        // display on
     };
     oled_cmd(init, sizeof(init));
+    vTaskDelay(pdMS_TO_TICKS(10)); // let display settle after init
 }
 
 void ssd1306_clear(void)
