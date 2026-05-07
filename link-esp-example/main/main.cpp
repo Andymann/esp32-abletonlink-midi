@@ -27,6 +27,7 @@
 #define MIDI_TX_PIN GPIO_NUM_17
 #define MIDI_RX_PIN GPIO_NUM_16
 #define MIDI2_TX_PIN GPIO_NUM_4
+#define MIDI2_RX_PIN GPIO_NUM_34
 #define LINK_TICK_PERIOD 100
 
 // Different lengths for different beat positions (in ticks)
@@ -206,10 +207,12 @@ void tickTask(void *userParam) {
   link.enableStartStopSync(true);
 
   initUartPort(MIDI_UART,  MIDI_TX_PIN,  MIDI_RX_PIN);
-  initUartPort(MIDI2_UART, MIDI2_TX_PIN, UART_PIN_NO_CHANGE);
+  initUartPort(MIDI2_UART, MIDI2_TX_PIN, MIDI2_RX_PIN);
 
-  // Initialize MIDI parser for incoming clock/start/stop detection
-  midi_parser_init();
+  // Two independent parser instances — midi1 takes clock precedence over midi2
+  midi_parser_state_t midi1_state, midi2_state;
+  midi_parser_init(&midi1_state);
+  midi_parser_init(&midi2_state);
 
   timerGroup0Init(LINK_TICK_PERIOD, xTaskGetCurrentTaskHandle());
 
@@ -224,22 +227,15 @@ void tickTask(void *userParam) {
   while (true) {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
-    // Process incoming MIDI messages from MIDI_UART
-    // Only play-state changes (START/STOP) touch Link here.
-    // Tempo is applied separately below so MIDI is the sole BPM source.
-    uint8_t midi_byte;
-    int bytes_read = uart_read_bytes(MIDI_UART, &midi_byte, 1, 0);
-    while (bytes_read > 0) {
-      send_midi_message(&midi_byte, 1);
-      midi_message_type_t msg = midi_parser_process_byte(midi_byte);
-
+    // Helper lambda to process transport messages from either MIDI port
+    auto handle_transport = [&](midi_message_type_t msg) {
       switch (msg) {
         case MIDI_MSG_START: {
           midi_transport_running = true;
-          lastTicks = -1;  // Force clock output on the very next tick
+          lastTicks = -1;
           auto ls = link.captureAppSessionState();
           const auto t = link.clock().micros();
-          ls.forceBeatAtTime(0.0, t, 4.0);  // 4-beat quantum = standard Ableton bar
+          ls.forceBeatAtTime(0.0, t, 4.0);
           ls.setIsPlaying(true, t);
           link.commitAppSessionState(ls);
           break;
@@ -258,25 +254,43 @@ void tickTask(void *userParam) {
           link.commitAppSessionState(ls);
           break;
         }
-        default:
-          break;
+        default: break;
       }
+    };
 
+    // Read and process MIDI_UART (primary)
+    uint8_t midi_byte;
+    int bytes_read = uart_read_bytes(MIDI_UART, &midi_byte, 1, 0);
+    while (bytes_read > 0) {
+      send_midi_message(&midi_byte, 1);
+      handle_transport(midi_parser_process_byte(&midi1_state, midi_byte));
       bytes_read = uart_read_bytes(MIDI_UART, &midi_byte, 1, 0);
     }
 
-    // When MIDI clock is active, push the MIDI-derived tempo into Link,
-    // but only when the value has actually changed (the EMA updates once per
-    // quarter note, so this fires at most ~2x/sec at 120 BPM — not every tick).
-    // When MIDI clock is absent, Link's own session tempo governs the outgoing clock.
-    if (midi_parser_is_clock_active() && midi_parser_is_tempo_ready()) {
-      static float last_pushed_tempo = 0.0f;
-      float midi_tempo = midi_parser_get_tempo();
-      if (fabsf(midi_tempo - last_pushed_tempo) > 0.01f) {
-        auto ls = link.captureAppSessionState();
-        ls.setTempo(midi_tempo, link.clock().micros());
-        link.commitAppSessionState(ls);
-        last_pushed_tempo = midi_tempo;
+    // Read and process MIDI2_UART (secondary)
+    bytes_read = uart_read_bytes(MIDI2_UART, &midi_byte, 1, 0);
+    while (bytes_read > 0) {
+      send_midi_message(&midi_byte, 1);
+      handle_transport(midi_parser_process_byte(&midi2_state, midi_byte));
+      bytes_read = uart_read_bytes(MIDI2_UART, &midi_byte, 1, 0);
+    }
+
+    // Push MIDI-derived tempo into Link. MIDI_UART takes precedence over MIDI2_UART.
+    // When no MIDI clock is active, Link's own session tempo governs the output clock.
+    {
+      midi_parser_state_t *active = nullptr;
+      if      (midi_parser_is_clock_active(&midi1_state)) active = &midi1_state;
+      else if (midi_parser_is_clock_active(&midi2_state)) active = &midi2_state;
+
+      if (active && midi_parser_is_tempo_ready(active)) {
+        static float last_pushed_tempo = 0.0f;
+        float midi_tempo = midi_parser_get_tempo(active);
+        if (fabsf(midi_tempo - last_pushed_tempo) > 0.01f) {
+          auto ls = link.captureAppSessionState();
+          ls.setTempo(midi_tempo, link.clock().micros());
+          link.commitAppSessionState(ls);
+          last_pushed_tempo = midi_tempo;
+        }
       }
     }
 
@@ -318,6 +332,16 @@ void tickTask(void *userParam) {
     const auto state = link.captureAppSessionState();
     const auto quantum = 16.0;
     const auto time = link.clock().micros();
+
+    // Update row 2 with current BPM when displayed value changes
+    static double last_displayed_tempo = -1.0;
+    double tempo = state.tempo();
+    if (fabs(tempo - last_displayed_tempo) >= 0.05) {
+      last_displayed_tempo = tempo;
+      char tbuf[16];
+      snprintf(tbuf, sizeof(tbuf), "%5.1f BPM", tempo);
+      ssd1306_write_string(2, tbuf, true, 2, 2);
+    }
     
     // Calculate both regular and adjusted phases
     const auto phase = state.phaseAtTime(time, quantum);
@@ -380,8 +404,9 @@ void tickTask(void *userParam) {
       }
 
       // Send exactly one 0xF8 timing clock per 24ppqn tick transition.
-      // Suppressed when MIDI clock is incoming — that clock is mirrored directly.
-      if (ticks > lastTicks && !midi_parser_is_clock_active()) {
+      // Suppressed when any MIDI clock is incoming — that clock is mirrored directly.
+      if (ticks > lastTicks && !midi_parser_is_clock_active(&midi1_state)
+                            && !midi_parser_is_clock_active(&midi2_state)) {
         const uint8_t timing_msg = MIDI_TIMING_CLOCK;
         send_midi_message(&timing_msg, 1);
       }
@@ -410,19 +435,23 @@ void tickTask(void *userParam) {
       led3_frac = (double)(elapsed % beat_us) / (double)beat_us;
     }
 
-    bool new_led1 = shouldPlay && midi_parser_is_clock_active();
+    bool new_led0 = shouldPlay && midi_parser_is_clock_active(&midi2_state);
+    bool new_led1 = shouldPlay && midi_parser_is_clock_active(&midi1_state);
     bool new_led3 = (led3_frac < 0.5) && is_connected;
 
+    static bool prev_led0 = false;
     static int64_t last_pulse_us = 0;
     const bool do_pulse = !led3_is_playing && is_connected &&
                           (time.count() - last_pulse_us >= 20000);
 
-    if (new_led1 != prev_led1 || new_led3 != prev_led3 ||
+    if (new_led0 != prev_led0 || new_led1 != prev_led1 || new_led3 != prev_led3 ||
         led3_is_playing != prev_led3_playing || do_pulse) {
       if (do_pulse) last_pulse_us = time.count();
+      prev_led0 = new_led0;
       prev_led1 = new_led1;
       prev_led3 = new_led3;
       prev_led3_playing = led3_is_playing;
+      ws2812_set_led(0, 0, new_led0 ? 255 : 0, 0);
       ws2812_set_led(1, 0, new_led1 ? 255 : 0, 0);
       if (!led3_is_playing && is_connected) {
         uint8_t red = (uint8_t)(sinf((float)M_PI * (float)led3_frac) * 255.0f);
@@ -455,7 +484,6 @@ extern "C" void app_main() {
   ssd1306_init();
   ssd1306_clear();
   ssd1306_write_string(0, "Ableton Link", true, 1, 2);
-  ssd1306_write_string(2, "Midi Clock Bridge", true, 1, 1);
   //ssd1306_write_string(3, " ", true, 1, 1);
   char buf[32];
   snprintf(buf, sizeof(buf), "FW: %s", VERSION_STRING);
@@ -467,7 +495,6 @@ extern "C" void app_main() {
   ws2812_set_all(0, 0, 0);
   ssd1306_clear();
   ssd1306_write_string(0, "Ableton Link", true, 1, 2);
-  ssd1306_write_string(2, "Midi Clock Bridge", true, 1, 1);
 
   xTaskCreate(tickTask, "ticks", 16384, nullptr, 10, nullptr);
 }
