@@ -19,6 +19,7 @@
 #include "midi_parser.h"
 #include "ssd1306.h"
 
+#define VERSION_STRING "0.6"
 #define PRINT_LINK_STATE false
 
 #define MIDI_UART   UART_NUM_2  // Hardware MIDI UART on GPIO17/16
@@ -291,7 +292,8 @@ void tickTask(void *userParam) {
       //if (num_peers == 0)      snprintf(buf, sizeof(buf), "no peers");
       //else if (num_peers == 1) snprintf(buf, sizeof(buf), "1 peer");
       //else                     snprintf(buf, sizeof(buf), "%d peers", (int)num_peers);
-      snprintf(buf, sizeof(buf), "Peers: %d", (int)num_peers);
+      //snprintf(buf, sizeof(buf), "Peers: %d", (int)num_peers);
+      snprintf(buf, sizeof(buf), "Peers: %d/%d", (int)num_peers, (int)WIFI_MAX_CONNECTIONS);
       ssd1306_write_string(3, buf, true, 2, 2);
     }
     if (!is_connected && !force_start && (esp_timer_get_time() - start_wait_time >= 3000000)) {  // 60 seconds in microseconds
@@ -455,7 +457,9 @@ extern "C" void app_main() {
   ssd1306_write_string(0, "Ableton Link", true, 1, 2);
   ssd1306_write_string(2, "Midi Clock Bridge", true, 1, 1);
   //ssd1306_write_string(3, " ", true, 1, 1);
-  ssd1306_write_string(3, "Firmware v0.5", true, 1, 2);
+  char buf[32];
+  snprintf(buf, sizeof(buf), "FW: %s", VERSION_STRING);
+  ssd1306_write_string(3, buf, true, 2, 2);
 
   ws2812_init();
   ws2812_set_all(0, 255, 0);
