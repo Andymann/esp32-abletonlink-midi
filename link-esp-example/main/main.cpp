@@ -1,5 +1,6 @@
 //idf 4.4.4
 #include <string.h>
+#include <cstdio>
 #include <cmath>
 #include <driver/gpio.h>
 #include <driver/timer.h>
@@ -97,7 +98,13 @@ static void ws2812_set_all(uint8_t r, uint8_t g, uint8_t b) {
   ws2812_show();
 }
 
-// WiFi AP configuration
+// When firmware reaches a somehat stable version enable this to allow multiple simultaneously running devices.
+// WiFi AP configuration — 3-digit suffix derived from __TIME__ at compile time,
+// constant after flashing. __TIME__ is "HH:MM:SS"; digits taken from H, M, S ones places.
+//static const char WIFI_SSID[] = {
+//  'A','b','l','e','t','o','n','-','L','i','n','k','-','E','S','P','3','2', '-',
+//  __TIME__[1], __TIME__[4], __TIME__[7], '\0'
+//};
 #define WIFI_SSID "Ableton-Link-ESP32"
 #define WIFI_PASS "1234567890"
 #define WIFI_CHANNEL 1
@@ -273,7 +280,20 @@ void tickTask(void *userParam) {
     }
 
     // Check peer status
-    bool is_connected = link.numPeers() > 0;
+    std::size_t num_peers = link.numPeers();
+    bool is_connected = num_peers > 0;
+
+    // Update row 3 when peer count changes
+    static std::size_t last_num_peers = (std::size_t)-1;
+    if (num_peers != last_num_peers) {
+      last_num_peers = num_peers;
+      char buf[16];
+      //if (num_peers == 0)      snprintf(buf, sizeof(buf), "no peers");
+      //else if (num_peers == 1) snprintf(buf, sizeof(buf), "1 peer");
+      //else                     snprintf(buf, sizeof(buf), "%d peers", (int)num_peers);
+      snprintf(buf, sizeof(buf), "Peers: %d", (int)num_peers);
+      ssd1306_write_string(3, buf, true, 2, 2);
+    }
     if (!is_connected && !force_start && (esp_timer_get_time() - start_wait_time >= 3000000)) {  // 60 seconds in microseconds
       force_start = true;
     }
@@ -435,13 +455,15 @@ extern "C" void app_main() {
   ssd1306_write_string(0, "Ableton Link", true, 1, 2);
   ssd1306_write_string(2, "Midi Clock Bridge", true, 1, 1);
   //ssd1306_write_string(3, " ", true, 1, 1);
-  ssd1306_write_string(3, "Firmware v0.5", true, 2, 2);
+  ssd1306_write_string(3, "Firmware v0.5", true, 1, 2);
 
   ws2812_init();
   ws2812_set_all(0, 255, 0);
   vTaskDelay(pdMS_TO_TICKS(4000));
   ws2812_set_all(0, 0, 0);
   ssd1306_clear();
+  ssd1306_write_string(0, "Ableton Link", true, 1, 2);
+  ssd1306_write_string(2, "Midi Clock Bridge", true, 1, 1);
 
   xTaskCreate(tickTask, "ticks", 16384, nullptr, 10, nullptr);
 }
